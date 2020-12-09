@@ -577,8 +577,8 @@ def _convert_transpose(builder, node, graph, err):  # type: (NeuralNetworkBuilde
         if 1 in mapp:
             batch_index = mapp.index(1)
             batch_index_new = coreml_perm.index(1)
-            if batch_index != batch_index_new:
-                return err.unsupported_op_configuration(builder, node, graph, "cannot transpose batch dimension")
+            # if batch_index != batch_index_new:
+            #     return err.unsupported_op_configuration(builder, node, graph, "cannot transpose batch dimension")
         perm_translated = []
         for c in coreml_perm:
             if c == 0:
@@ -1714,16 +1714,27 @@ def _convert_lstm(builder, node, graph, err):  # type: (NeuralNetworkBuilder, No
         err.missing_initializer(node,
                                 "Weight tensor: {} not found in the graph initializer".format(R_name, ))
 
+    # Extract direction from ONNX attribute
+    direction = 1
+    if 'direction' in node.attrs and node.attrs['direction'].decode('utf-8') == 'bidirectional':
+        direction = 2
+
+    W = np.split(W, direction)
+    R = np.split(R, direction)
+    if B is not None:
+        B = np.split(B, direction)
+    else:
+        B = [None, None]
     h = node.attrs["hidden_size"]
-    W_i, W_o, W_f, W_c = np.split(np.squeeze(W), 4)  #type: ignore
-    R_i, R_o, R_f, R_c = np.split(np.squeeze(R), 4)  #type: ignore
+    W_i, W_o, W_f, W_c = np.split(np.squeeze(W[0]), 4)  #type: ignore
+    R_i, R_o, R_f, R_c = np.split(np.squeeze(R[0]), 4)  #type: ignore
     x = W_i.shape[1]
     h = W_i.shape[0]
     W_x = [W_i, W_f, W_o, W_c]
     W_h = [R_i, R_f, R_o, R_c]
     b = None
     if B is not None:
-        b_Wi, b_Wo, b_Wf, b_Wc, b_Ri, b_Ro, b_Rf, b_Rc = np.split(np.squeeze(B), 8)  #type: ignore
+        b_Wi, b_Wo, b_Wf, b_Wc, b_Ri, b_Ro, b_Rf, b_Rc = np.split(np.squeeze(B[0]), 8)  #type: ignore
         b = [b_Wi + b_Ri, b_Wf + b_Rf, b_Wo + b_Ro, b_Wc + b_Rc]
 
     input_h = node.inputs[5] if len(node.inputs) > 5 else node.inputs[0] + '_h_input'
@@ -1736,7 +1747,8 @@ def _convert_lstm(builder, node, graph, err):  # type: (NeuralNetworkBuilder, No
     graph.optional_outputs.append((output_h, (h)))
     graph.optional_outputs.append((output_c, (h)))
 
-    builder.add_unilstm(name = node.name,
+    if direction == 1:
+        builder.add_unilstm(name = node.name,
                     W_h = W_h,
                     W_x = W_x,
                     b = b,
@@ -1751,11 +1763,79 @@ def _convert_lstm(builder, node, graph, err):  # type: (NeuralNetworkBuilder, No
                     output_all=True,
                     forget_bias=False, coupled_input_forget_gate=False,
                     cell_clip_threshold=50000.0, reverse_input=False)
+        if _is_input_shape_mapping_defined(node, graph):
+            graph.onnx_coreml_shape_mapping[node.outputs[0]] = graph.onnx_coreml_shape_mapping[node.inputs[0]]
+            graph.onnx_coreml_shape_mapping[node.outputs[1]] = graph.onnx_coreml_shape_mapping[node.inputs[0]]
+            graph.onnx_coreml_shape_mapping[node.outputs[2]] = graph.onnx_coreml_shape_mapping[node.inputs[0]]
+    elif direction == 2:
+        if len(W) != 2 and len(R) != 2 and len(B) != 2:
+            err.unsupported_op_configuration(builder, node, graph, "Bi-Directional LSTM does not have weights for both the directions")
+        W_i_back, W_o_back, W_f_back, W_c_back = np.split(np.squeeze(W[1]), 4)  #type: ignore
+        R_i_back, R_o_back, R_f_back, R_c_back = np.split(np.squeeze(R[1]), 4)  #type: ignore
+        W_x_back = [W_i_back, W_f_back, W_o_back, W_c_back]
+        W_h_back = [R_i_back, R_f_back, R_o_back, R_c_back]
+        b_back= None
+        if B is not None:
+            b_Wi_back, b_Wo_back, b_Wf_back, b_Wc_back, b_Ri_back, b_Ro_back, b_Rf_back, b_Rc_back = np.split(np.squeeze(B[1]), 8)  # type: ignore
+            b_back = [b_Wi_back + b_Ri_back, b_Wf_back + b_Rf_back, b_Wo_back + b_Ro_back, b_Wc_back + b_Rc_back]
+        # split input_h and input_c into two parts
+        builder.add_split_nd(
+            name=node.name+'_split_h',
+            input_name=input_h,
+            output_names=[input_h+'_f', input_h+'_b'],
+            axis=0
+        )
+        # OPTIMIZATION: If input_h and input_c are same
+        # Avoid creating new split and instead reuse
+        if input_h != input_c:
+            builder.add_split_nd(
+                name=node.name+'_split_c',
+                input_name=input_c,
+                output_names=[input_c+'_f', input_c+'_b'],
+                axis=0
+            )
+        builder.add_bidirlstm(
+            name=node.name,
+            W_h=W_h,
+            W_x=W_x,
+            b=b,
+            W_h_back=W_h_back,
+            W_x_back=W_x_back,
+            b_back=b_back,
+            hidden_size=h,
+            input_size=x,
+            input_names= [node.inputs[0], input_h+'_f', input_c+'_f', input_h+'_b', input_c+'_b'],
+            output_names= [node.outputs[0], output_h+'_f', output_c+'_f', output_h+'_b', output_c+'_b'],
+            inner_activation='SIGMOID',
+            cell_state_update_activation='TANH',
+            output_activation='TANH',
+            peep=None,
+            output_all=True,
+            peep_back=None,
+            forget_bias=True,
+            coupled_input_forget_gate=False,
+            cell_clip_threshold=50000.0
+        )
+        # Combine output_h and output_c
+        builder.add_concat_nd(
+            name=node.name+'concat_output_h',
+            input_names=[output_h+'_f', output_h+'_b'],
+            output_name=output_h,
+            axis=0
+        )
+        builder.add_concat_nd(
+            name=node.name+'concat_output_c',
+            input_names=[output_c+'_f', output_c+'_b'],
+            output_name=output_c,
+            axis=0
+        )
+        if _is_input_shape_mapping_defined(node, graph):
+            graph.onnx_coreml_shape_mapping[node.outputs[0]] = [0, 1, 2, 3]
+            graph.onnx_coreml_shape_mapping[node.outputs[1]] = [0, 1, 2, 3]
+            graph.onnx_coreml_shape_mapping[node.outputs[2]] = [0, 1, 2, 3]
+    else:
+        err.unsupported_op_configuration(builder, node, graph, "Unsupported direction {} for LSTM".format(direction))
 
-    if _is_input_shape_mapping_defined(node, graph):
-        graph.onnx_coreml_shape_mapping[node.outputs[0]] = graph.onnx_coreml_shape_mapping[node.inputs[0]]
-        graph.onnx_coreml_shape_mapping[node.outputs[1]] = graph.onnx_coreml_shape_mapping[node.inputs[0]]
-        graph.onnx_coreml_shape_mapping[node.outputs[2]] = graph.onnx_coreml_shape_mapping[node.inputs[0]]
 
 
 
